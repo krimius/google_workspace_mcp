@@ -62,6 +62,8 @@ from auth.scopes import (
     SCRIPT_PROJECTS_READONLY_SCOPE,
     SCRIPT_DEPLOYMENTS_SCOPE,
     SCRIPT_DEPLOYMENTS_READONLY_SCOPE,
+    SCRIPT_EXTERNAL_REQUEST_SCOPE,
+    SCRIPT_SCRIPTAPP_SCOPE,
     has_required_scopes,
 )
 
@@ -577,6 +579,8 @@ SCOPE_GROUPS = {
     "script_projects": SCRIPT_PROJECTS_SCOPE,
     "script_deployments": SCRIPT_DEPLOYMENTS_SCOPE,
     "script_deployments_readonly": SCRIPT_DEPLOYMENTS_READONLY_SCOPE,
+    "script_run": SCRIPT_EXTERNAL_REQUEST_SCOPE,
+    "script_scriptapp": SCRIPT_SCRIPTAPP_SCOPE,
 }
 
 

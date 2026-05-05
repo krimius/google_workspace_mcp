@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_CHUNK_SIZE_BYTES = 256 * 1024  # 256 KB
 UPLOAD_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (Google recommended minimum)
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB safety limit for URL downloads
+SHARED_DRIVE_ORGANIZER_CONCURRENCY_LIMIT = 10
 
 
 async def _stream_url_with_validation(
@@ -585,11 +586,15 @@ async def list_drive_items(
     file_type: Optional[str] = None,
     detailed: bool = True,
     order_by: Optional[str] = None,
+    resource_type: str = "items",
+    query: Optional[str] = None,
+    include_organizers: bool = False,
 ) -> str:
     """
-    Lists files and folders, supporting shared drives.
+    Lists files/folders or shared drive containers, supporting shared drives.
     If `drive_id` is specified, lists items within that shared drive. `folder_id` is then relative to that drive (or use drive_id as folder_id for root).
     If `drive_id` is not specified, lists items from user's "My Drive" and accessible shared drives (if `include_items_from_all_drives` is True).
+    Set `resource_type` to "shared_drives" to list shared drive containers instead of folder contents.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -610,14 +615,35 @@ async def list_drive_items(
                                   'name', 'name_natural', 'quotaBytesUsed', 'recency', 'sharedWithMeTime',
                                   'starred', 'viewedByMeTime'. Example: 'modifiedTime desc' or 'folder,modifiedTime desc,name'.
                                   Defaults to None (Drive API default ordering).
+        resource_type (str): What to list. Use "items" for folder contents or
+                             "shared_drives" for shared drive containers. Defaults to "items".
+        query (Optional[str]): Shared drive query used only when resource_type="shared_drives",
+                               e.g. "name contains 'Engineering'".
+        include_organizers (bool): When resource_type="shared_drives", include principals
+                                   with the organizer role. This costs one extra permissions.list
+                                   API call per shared drive returned. Defaults to False.
 
     Returns:
-        str: A formatted list of files/folders in the specified folder.
+        str: A formatted list of files/folders in the specified folder or shared drives.
              Includes a nextPageToken line when more results are available.
     """
     logger.info(
-        f"[list_drive_items] Invoked. Email: '{user_google_email}', Folder ID: '{folder_id}', File Type: '{file_type}'"
+        f"[list_drive_items] Invoked. Email: '{user_google_email}', Folder ID: '{folder_id}', "
+        f"File Type: '{file_type}', Resource Type: '{resource_type}'"
     )
+
+    normalized_resource_type = resource_type.lower().strip()
+    if normalized_resource_type == "shared_drives":
+        return await _list_shared_drives_impl(
+            service=service,
+            user_google_email=user_google_email,
+            page_size=page_size,
+            page_token=page_token,
+            query=query,
+            include_organizers=include_organizers,
+        )
+    if normalized_resource_type != "items":
+        raise ValueError("resource_type must be either 'items' or 'shared_drives'")
 
     resolved_folder_id = await resolve_folder_id(service, folder_id)
     final_query = f"'{resolved_folder_id}' in parents and trashed=false"
@@ -665,6 +691,129 @@ async def list_drive_items(
         formatted_items_text_parts.append(f"nextPageToken: {next_token}")
     text_output = "\n".join(formatted_items_text_parts)
     return text_output
+
+
+async def _list_shared_drives_impl(
+    service,
+    user_google_email: str,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+    query: Optional[str] = None,
+    include_organizers: bool = False,
+) -> str:
+    """List shared drives available to the authenticated user."""
+    logger.info(
+        f"[list_shared_drives] Invoked. Email: '{user_google_email}', page_size: {page_size}, "
+        f"include_organizers: {include_organizers}"
+    )
+
+    list_params: Dict[str, Any] = {
+        "pageSize": min(max(page_size, 1), 100),
+        "fields": (
+            "drives(id, name, createdTime, hidden, "
+            "restrictions, capabilities(canManageMembers, canEdit)), "
+            "nextPageToken"
+        ),
+    }
+    if page_token:
+        list_params["pageToken"] = page_token
+    if query:
+        list_params["q"] = query
+
+    results = await asyncio.to_thread(service.drives().list(**list_params).execute)
+    drives = results.get("drives", [])
+    if not drives:
+        return f"No shared drives found for {user_google_email}."
+
+    if include_organizers:
+
+        async def _fetch_organizers(d: Dict[str, Any]) -> None:
+            try:
+                permissions = []
+                next_permission_page_token = None
+
+                while True:
+                    list_kwargs: Dict[str, Any] = {
+                        "fileId": d["id"],
+                        "supportsAllDrives": True,
+                        "useDomainAdminAccess": False,
+                        "fields": (
+                            "nextPageToken, "
+                            "permissions(emailAddress, displayName, role, type, domain)"
+                        ),
+                        "pageSize": 100,
+                    }
+                    if next_permission_page_token:
+                        list_kwargs["pageToken"] = next_permission_page_token
+
+                    perms = await asyncio.to_thread(
+                        service.permissions().list(**list_kwargs).execute
+                    )
+                    permissions.extend(perms.get("permissions", []))
+
+                    next_permission_page_token = perms.get("nextPageToken")
+                    if not next_permission_page_token:
+                        break
+
+                d["_organizers"] = [
+                    p for p in permissions if p.get("role") == "organizer"
+                ]
+            except HttpError as e:
+                status = getattr(e, "status_code", None)
+                if status is None and getattr(e, "resp", None) is not None:
+                    status = getattr(e.resp, "status", None)
+                reason = getattr(e, "reason", None) or str(e)
+                d["_organizers_error"] = f"{status or 'unknown'}: {reason}"
+
+        organizer_fetch_sem = asyncio.Semaphore(
+            SHARED_DRIVE_ORGANIZER_CONCURRENCY_LIMIT
+        )
+
+        async def _bounded_fetch_organizers(d: Dict[str, Any]) -> None:
+            async with organizer_fetch_sem:
+                await _fetch_organizers(d)
+
+        await asyncio.gather(*[_bounded_fetch_organizers(d) for d in drives])
+
+    next_token = results.get("nextPageToken")
+    parts = [f"Found {len(drives)} shared drives for {user_google_email}:"]
+    for d in drives:
+        caps = d.get("capabilities") or {}
+        rest = d.get("restrictions") or {}
+        cap_flags = ", ".join(k for k, v in caps.items() if v) or "none"
+        rest_flags = ", ".join(k for k, v in rest.items() if v) or "none"
+        hidden = " [hidden]" if d.get("hidden") else ""
+        parts.append(
+            f'- Name: "{d["name"]}" (ID: {d["id"]}, Created: {d.get("createdTime", "N/A")}){hidden} '
+            f"Capabilities: {cap_flags}; Restrictions: {rest_flags}"
+        )
+        if include_organizers:
+            err = d.get("_organizers_error")
+            if err:
+                parts.append(f"  Organizers: <error: {err}>")
+            else:
+                organizers = d.get("_organizers", [])
+                if not organizers:
+                    parts.append("  Organizers: <none returned>")
+                else:
+                    for o in organizers:
+                        identifier = (
+                            o.get("emailAddress")
+                            or o.get("domain")
+                            or o.get("displayName")
+                            or o.get("type", "?")
+                        )
+                        display = o.get("displayName")
+                        kind = o.get("type", "?")
+                        suffix = (
+                            f' ("{display}")'
+                            if display and display != identifier
+                            else ""
+                        )
+                        parts.append(f"  Organizer ({kind}): {identifier}{suffix}")
+    if next_token:
+        parts.append(f"nextPageToken: {next_token}")
+    return "\n".join(parts)
 
 
 async def _create_drive_folder_impl(
@@ -1389,6 +1538,7 @@ async def check_drive_file_public_access(
     service,
     user_google_email: str,
     file_name: str,
+    drive_id: Optional[str] = None,
 ) -> str:
     """
     Searches for a file by name and checks if it has public link sharing enabled.
@@ -1396,23 +1546,34 @@ async def check_drive_file_public_access(
     Args:
         user_google_email (str): The user's Google email address. Required.
         file_name (str): The name of the file to check.
+        drive_id (Optional[str]): ID of the shared drive to scope the search to. When set, the
+                                  underlying files.list call uses corpora='drive' and the given
+                                  driveId, which is required to reliably find files that live only
+                                  in that shared drive. When None, behaviour is unchanged
+                                  (default API corpora applies).
 
     Returns:
         str: Information about the file's sharing status and whether it can be used in Google Docs.
     """
-    logger.info(f"[check_drive_file_public_access] Searching for {file_name}")
+    logger.info(
+        f"[check_drive_file_public_access] Searching for {file_name}"
+        + (f" within drive_id={drive_id}" if drive_id else "")
+    )
 
     # Search for the file
     escaped_name = file_name.replace("'", "\\'")
     query = f"name = '{escaped_name}'"
 
-    list_params = {
+    list_params: Dict[str, Any] = {
         "q": query,
         "pageSize": 10,
         "fields": "files(id, name, mimeType, webViewLink)",
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
     }
+    if drive_id:
+        list_params["corpora"] = "drive"
+        list_params["driveId"] = drive_id
 
     results = await asyncio.to_thread(service.files().list(**list_params).execute)
 

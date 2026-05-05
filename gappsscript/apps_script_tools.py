@@ -432,7 +432,7 @@ async def _run_script_function_impl(
     ),
 )
 @handle_http_errors("run_script_function", service_type="script")
-@require_google_service("script", "script_projects")
+@require_google_service("script", "script_run")
 async def run_script_function(
     service: Any,
     user_google_email: str,
