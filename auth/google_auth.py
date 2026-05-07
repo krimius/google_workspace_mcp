@@ -462,7 +462,6 @@ async def start_auth_flow(
     user_google_email: Optional[str],
     service_name: str,  # e.g., "Google Calendar", "Gmail" for user messages
     redirect_uri: str,  # Added redirect_uri as a required parameter
-    additional_scopes: Optional[List[str]] = None,
 ) -> str:
     """
     Initiates the Google OAuth flow and returns an actionable message for the user.
@@ -471,11 +470,6 @@ async def start_auth_flow(
         user_google_email: The user's specified Google email, if provided.
         service_name: The name of the Google service requiring auth (for user messages).
         redirect_uri: The URI Google will redirect to after authorization.
-        additional_scopes (Optional[List[str]]): A list of extra OAuth scope
-            strings to request when building the auth URL and credentials, for
-            example ["https://www.googleapis.com/auth/drive.readonly"]. Defaults
-            to None, which requests no extra scopes beyond the currently enabled
-            tool scopes.
 
     Returns:
         A formatted string containing guidance for the LLM/user.
@@ -511,8 +505,6 @@ async def start_auth_flow(
 
         oauth_state = os.urandom(16).hex()
         current_scopes = get_current_scopes()
-        if additional_scopes:
-            current_scopes = list(set(current_scopes).union(additional_scopes))
 
         flow = create_oauth_flow(
             scopes=current_scopes,  # Use scopes for enabled tools only
@@ -1290,7 +1282,6 @@ async def get_authenticated_google_service(
             user_google_email=user_google_email,
             service_name=f"Google {service_name.title()}",
             redirect_uri=redirect_uri,
-            additional_scopes=required_scopes,
         )
 
         # Extract the auth URL from the response and raise with it

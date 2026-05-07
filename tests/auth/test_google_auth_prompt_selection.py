@@ -4,7 +4,7 @@ import pytest
 
 from google.auth.exceptions import RefreshError
 
-from auth.google_auth import _determine_oauth_prompt, start_auth_flow
+from auth.google_auth import _determine_oauth_prompt
 
 
 class _DummyCredentialStore:
@@ -29,53 +29,6 @@ class _DummySessionStore:
 
 def _credentials_with_scopes(scopes, valid=True, refresh_token="fake-token"):
     return SimpleNamespace(scopes=scopes, valid=valid, refresh_token=refresh_token)
-
-
-@pytest.mark.asyncio
-async def test_start_auth_flow_includes_additional_scopes(monkeypatch):
-    captured = {}
-
-    class _DummyFlow:
-        code_verifier = "verifier"
-
-        def authorization_url(self, **kwargs):
-            captured["authorization_kwargs"] = kwargs
-            return "https://example.com/auth", None
-
-    class _DummyOAuthStore:
-        def store_oauth_state(self, *args, **kwargs):  # noqa: ARG002
-            captured["stored_state"] = True
-
-    def fake_create_oauth_flow(**kwargs):
-        captured["scopes"] = kwargs["scopes"]
-        return _DummyFlow()
-
-    async def fake_determine_prompt(**kwargs):
-        captured["prompt_scopes"] = kwargs["required_scopes"]
-        return "consent"
-
-    monkeypatch.setattr("auth.google_auth.get_current_scopes", lambda: ["scope.base"])
-    monkeypatch.setattr("auth.google_auth.create_oauth_flow", fake_create_oauth_flow)
-    monkeypatch.setattr(
-        "auth.google_auth._determine_oauth_prompt", fake_determine_prompt
-    )
-    monkeypatch.setattr("auth.google_auth.get_fastmcp_session_id", lambda: None)
-    monkeypatch.setattr(
-        "auth.google_auth.get_oauth21_session_store", lambda: _DummyOAuthStore()
-    )
-
-    message = await start_auth_flow(
-        user_google_email="user@gmail.com",
-        service_name="Google Chat",
-        redirect_uri="http://localhost:8000/oauth2callback",
-        additional_scopes=["scope.extra"],
-    )
-
-    assert "https://example.com/auth" in message
-    assert set(captured["scopes"]) == {"scope.base", "scope.extra"}
-    assert set(captured["prompt_scopes"]) == {"scope.base", "scope.extra"}
-    assert captured["authorization_kwargs"]["prompt"] == "consent"
-    assert captured["stored_state"] is True
 
 
 @pytest.mark.asyncio
