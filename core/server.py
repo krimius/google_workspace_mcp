@@ -48,12 +48,16 @@ _legacy_callback_registered = False
 session_middleware = Middleware(MCPSessionMiddleware)
 
 
+# Schemes whose origins are trusted wholesale. VS Code assigns a fresh,
+# unpredictable host (a GUID) to every webview, so its origin can never be
+# enumerated in an allowlist; the scheme itself is the trust boundary.
+TRUSTED_ORIGIN_SCHEMES = frozenset({"vscode-webview"})
+
+
 def _normalize_origin(origin: str) -> Optional[str]:
     parsed = urlparse(origin)
     if not parsed.scheme:
         return None
-    if parsed.scheme == "vscode-webview":
-        return f"vscode-webview://{parsed.netloc}" if parsed.netloc else None
     if not parsed.hostname:
         return None
     try:
@@ -87,6 +91,8 @@ def _get_allowed_http_origins() -> set[str]:
 
 
 def _is_origin_allowed(origin: str) -> bool:
+    if urlparse(origin).scheme in TRUSTED_ORIGIN_SCHEMES:
+        return True
     if _is_loopback_origin(origin):
         return True
     normalized = _normalize_origin(origin)

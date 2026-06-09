@@ -108,15 +108,16 @@ def test_origin_validation_allows_configured_external_origin(monkeypatch):
     assert response.status_code == 200
 
 
-def test_origin_validation_vscode_webview_scoping(monkeypatch):
+def test_origin_validation_trusts_any_vscode_webview_origin(monkeypatch):
     from core.server import OriginValidationMiddleware
 
+    # VS Code assigns a fresh, random GUID authority to every webview, so its
+    # origin can never be enumerated in an allowlist. The scheme is the trust
+    # boundary; any vscode-webview origin must be accepted regardless of host.
     monkeypatch.setattr(
         "auth.oauth_config.get_oauth_config",
         lambda: SimpleNamespace(
-            get_allowed_origins=lambda: [
-                "vscode-webview://publisher.extension/somepath"
-            ],
+            get_allowed_origins=lambda: ["http://localhost:8000"],
             external_url=None,
         ),
     )
@@ -130,18 +131,22 @@ def test_origin_validation_vscode_webview_scoping(monkeypatch):
     )
     client = TestClient(app)
 
-    # Matching extension origin is accepted
+    # Real-world VS Code webview origins carry a unique per-session GUID host.
+    for host in (
+        "1a2b3c4d-5e6f-7a8b-9c0d-1234567890ab",
+        "ffffffff-0000-1111-2222-333344445555",
+        "publisher.extension",
+    ):
+        assert (
+            client.get(
+                "/health", headers={"Origin": f"vscode-webview://{host}"}
+            ).status_code
+            == 200
+        )
+
+    # A genuine browser web origin that is not configured is still rejected.
     assert (
-        client.get(
-            "/health", headers={"Origin": "vscode-webview://publisher.extension"}
-        ).status_code
-        == 200
-    )
-    # Different extension origin is rejected
-    assert (
-        client.get(
-            "/health", headers={"Origin": "vscode-webview://other.publisher"}
-        ).status_code
+        client.get("/health", headers={"Origin": "https://evil.test"}).status_code
         == 403
     )
 
