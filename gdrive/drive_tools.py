@@ -921,8 +921,14 @@ async def create_drive_file(
     )
 
     has_existing_content_source = content is not None or fileUrl is not None
-    if not has_existing_content_source and base64_content is None and mime_type != FOLDER_MIME_TYPE:
-        raise ValueError("You must provide one of 'content', 'fileUrl', or 'base64_content'.")
+    if (
+        not has_existing_content_source
+        and base64_content is None
+        and mime_type != FOLDER_MIME_TYPE
+    ):
+        raise ValueError(
+            "You must provide one of 'content', 'fileUrl', or 'base64_content'."
+        )
     if base64_content is not None and has_existing_content_source:
         raise ValueError("'base64_content' cannot be used with 'content' or 'fileUrl'.")
     if content_mime_type is not None and base64_content is None:
