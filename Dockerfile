@@ -37,8 +37,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 
 # --- Loma deployment config (baked so it survives Railway env-var staging quirks) ---
 ENV MCP_ENABLE_OAUTH21=true
-ENV WORKSPACE_MCP_BASE_URI=https://gmail-mcp-production.up.railway.app
-ENV WORKSPACE_EXTERNAL_URL=https://gmail-mcp-production.up.railway.app
+ENV WORKSPACE_MCP_BASE_URI=https://loma-gmail-oversight.up.railway.app
+ENV WORKSPACE_EXTERNAL_URL=https://loma-gmail-oversight.up.railway.app
 ENV WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS=https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback
 ENV WORKSPACE_MCP_BRAND_NAME="Loma GSB Mail"
 # Placeholder Google creds so the server boots in OAuth 2.1 mode; override with the real Web client via Railway variables
