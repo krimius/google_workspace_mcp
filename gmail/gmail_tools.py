@@ -51,6 +51,11 @@ from auth.scopes import (
     GMAIL_MODIFY_SCOPE,
     GMAIL_LABELS_SCOPE,
 )
+from gmail.attachment_mime import (
+    add_attachment_to_raw,
+    list_attachments_from_raw,
+    remove_attachment_from_raw,
+)
 from gmail.gmail_helpers import (
     GMAIL_METADATA_HEADERS,
     RAW_BODY_TRUNCATE_LIMIT,
@@ -2616,6 +2621,139 @@ async def draft_gmail_message(
         attached_count, requested_attachment_count
     )
     return f"Draft created{attachment_info}! Draft ID: {draft_id}"
+
+
+# ── Attachments on an existing draft (Loma Phase-2) ──────────────────────────
+# These attach to a draft you already created with draft_gmail_message. Bytes
+# never travel through the model's text channel: the SERVER downloads the file
+# from a URL (SSRF-checked, 25 MB cap). For a LOCAL file, stage it to a signed
+# URL first (e.g. an R2 signed upload) and pass that URL — do NOT paste bytes.
+# The draft's raw MIME is fetched, transformed (preserving the plain/html body),
+# and written back with drafts().update.
+
+@server.tool(
+    name="add_attachment_from_url",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+    ),
+)
+@handle_http_errors("add_attachment_from_url", service_type="gmail")
+@require_google_service("gmail", GMAIL_COMPOSE_SCOPE)
+async def add_attachment_from_url(
+    service,
+    user_google_email: str,
+    draft_id: Annotated[
+        str, Field(description="The Gmail draft ID to attach to (returned by draft_gmail_message).")
+    ],
+    url: Annotated[
+        str,
+        Field(
+            description=(
+                "http(s) URL of the file to attach. The SERVER downloads it "
+                "(SSRF-checked, 25 MB Gmail cap). For a LOCAL file, first stage it to a "
+                "signed URL (e.g. an R2 signed upload) and pass that URL — never paste "
+                "file bytes into chat."
+            )
+        ),
+    ],
+    name: Annotated[
+        Optional[str],
+        Field(description="Optional filename for the attachment. Defaults to the URL's last path segment."),
+    ] = None,
+) -> str:
+    """Attach a web-hosted file to an existing Gmail draft, preserving its body.
+
+    Bytes flow server<-URL, never through chat. After attaching, call
+    list_attachments to verify. [gmail.compose]
+    """
+    data, resp = await _download_attachment_bytes(url)
+    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower() or None
+    if not name:
+        name = unquote(urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]) or "attachment.bin"
+
+    draft = await asyncio.to_thread(
+        service.users().drafts().get(userId="me", id=draft_id, format="raw").execute
+    )
+    raw_bytes = base64.urlsafe_b64decode(draft["message"]["raw"])
+    new_raw = add_attachment_to_raw(raw_bytes, name, data, ctype)
+    new_b64 = base64.urlsafe_b64encode(new_raw).decode()
+
+    await asyncio.to_thread(
+        service.users()
+        .drafts()
+        .update(userId="me", id=draft_id, body={"message": {"raw": new_b64}})
+        .execute,
+        num_retries=GOOGLE_API_WRITE_RETRIES,
+    )
+    return (
+        f"Attached '{name}' ({len(data)} bytes, {ctype or 'application/octet-stream'}) "
+        f"to draft {draft_id}. Verify with list_attachments."
+    )
+
+
+@server.tool(
+    name="list_attachments",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+    ),
+)
+@handle_http_errors("list_attachments", service_type="gmail")
+@require_google_service("gmail", GMAIL_COMPOSE_SCOPE)
+async def list_attachments(
+    service,
+    user_google_email: str,
+    draft_id: Annotated[str, Field(description="The Gmail draft ID to inspect.")],
+) -> str:
+    """List the attachments currently on a Gmail draft (name, type, size). [gmail.compose]"""
+    draft = await asyncio.to_thread(
+        service.users().drafts().get(userId="me", id=draft_id, format="raw").execute
+    )
+    raw_bytes = base64.urlsafe_b64decode(draft["message"]["raw"])
+    atts = list_attachments_from_raw(raw_bytes)
+    if not atts:
+        return f"Draft {draft_id} has no attachments."
+    lines = [f"Draft {draft_id} has {len(atts)} attachment(s):"]
+    for a in atts:
+        lines.append(
+            f"  - {a['filename']} ({a['content_type']}, {a['size']} bytes)"
+        )
+    return "\n".join(lines)
+
+
+@server.tool(
+    name="remove_attachment",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+    ),
+)
+@handle_http_errors("remove_attachment", service_type="gmail")
+@require_google_service("gmail", GMAIL_COMPOSE_SCOPE)
+async def remove_attachment(
+    service,
+    user_google_email: str,
+    draft_id: Annotated[str, Field(description="The Gmail draft ID to modify.")],
+    filename: Annotated[
+        str, Field(description="Filename of the attachment to remove (see list_attachments).")
+    ],
+) -> str:
+    """Remove the first attachment matching ``filename`` from a draft, without
+    touching the body. [gmail.compose]"""
+    draft = await asyncio.to_thread(
+        service.users().drafts().get(userId="me", id=draft_id, format="raw").execute
+    )
+    raw_bytes = base64.urlsafe_b64decode(draft["message"]["raw"])
+    new_raw, removed = remove_attachment_from_raw(raw_bytes, filename)
+    if not removed:
+        return f"No attachment named '{filename}' found on draft {draft_id}."
+    new_b64 = base64.urlsafe_b64encode(new_raw).decode()
+    await asyncio.to_thread(
+        service.users()
+        .drafts()
+        .update(userId="me", id=draft_id, body={"message": {"raw": new_b64}})
+        .execute,
+        num_retries=GOOGLE_API_WRITE_RETRIES,
+    )
+    return f"Removed '{filename}' from draft {draft_id}."
 
 
 def _format_thread_content(
