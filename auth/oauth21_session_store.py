@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
 from fastmcp.server.auth import AccessToken
+from fastmcp.server.dependencies import get_http_headers
 from google.oauth2.credentials import Credentials
 from auth.oauth_config import is_external_oauth21_provider
 
@@ -1032,30 +1033,126 @@ def _resolve_client_credentials() -> Tuple[Optional[str], Optional[str]]:
     return client_id, client_secret
 
 
-def _build_credentials_from_provider(
+def _extract_fastmcp_token_jti(provider: Any) -> Optional[str]:
+    """Return the jti of the FastMCP-issued JWT on the current request.
+
+    FastMCP 3.4.2 keys its stored upstream Google token set by this jti. Only a
+    signature-verified token is used: anything else resolves to None so the
+    caller falls back to a credential without a refresh token rather than
+    trusting an unverified lookup key.
+    """
+    try:
+        issuer = provider.jwt_issuer
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(f"FastMCP JWT issuer unavailable: {exc}")
+        return None
+    if issuer is None:
+        return None
+
+    try:
+        headers = get_http_headers(include={"authorization"}) or {}
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(f"Failed to read the authorization header: {exc}")
+        return None
+
+    auth_header = headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None
+
+    raw_token = auth_header[7:].strip()
+    if not raw_token or raw_token.startswith("ya29."):
+        # A raw Google access token is not a FastMCP JWT and carries no jti.
+        return None
+
+    try:
+        payload = issuer.verify_token(raw_token)
+    except Exception as exc:
+        logger.debug(f"FastMCP token did not verify while resolving its jti: {exc}")
+        return None
+
+    jti = payload.get("jti") if isinstance(payload, dict) else None
+    return jti or None
+
+
+async def _resolve_upstream_token_set(provider: Any) -> Optional[Any]:
+    """Fetch the UpstreamTokenSet that FastMCP 3.4.2 holds for this request.
+
+    The chain is: request JWT -> jti -> ``_jti_mapping_store`` ->
+    ``_upstream_token_store``. The result carries the real Google access token,
+    the real Google refresh token and Google's own expiry.
+    """
+    jti_store = getattr(provider, "_jti_mapping_store", None)
+    upstream_store = getattr(provider, "_upstream_token_store", None)
+    if jti_store is None or upstream_store is None:
+        logger.debug("Auth provider exposes no FastMCP upstream token stores")
+        return None
+
+    jti = _extract_fastmcp_token_jti(provider)
+    if not jti:
+        return None
+
+    try:
+        mapping = await jti_store.get(key=jti)
+    except Exception as exc:
+        logger.debug(f"JTI mapping lookup failed: {exc}")
+        return None
+    if not mapping:
+        logger.debug("No JTI mapping stored for the current FastMCP token")
+        return None
+
+    upstream_token_id = getattr(mapping, "upstream_token_id", None)
+    if not upstream_token_id:
+        return None
+
+    try:
+        return await upstream_store.get(key=upstream_token_id)
+    except Exception as exc:
+        logger.debug(f"Upstream token lookup failed: {exc}")
+        return None
+
+
+async def _build_credentials_from_provider(
     access_token: AccessToken,
 ) -> Optional[Credentials]:
-    """Construct Google credentials from the provider cache."""
+    """Construct Google credentials from FastMCP's upstream token store.
+
+    The Google access token, the Google refresh token and Google's own expiry
+    all come from the stored UpstreamTokenSet, so google-auth can renew the
+    credential itself once Google's access token ages out.
+    """
     if not _auth_provider:
         return None
 
-    access_entry = getattr(_auth_provider, "_access_tokens", {}).get(access_token.token)
-    if not access_entry:
-        access_entry = access_token
-
     client_id, client_secret = _resolve_client_credentials()
 
-    refresh_token_value = getattr(_auth_provider, "_access_to_refresh", {}).get(
-        access_token.token
-    )
-    refresh_token_obj = None
-    if refresh_token_value:
-        refresh_token_obj = getattr(_auth_provider, "_refresh_tokens", {}).get(
-            refresh_token_value
+    token = access_token.token
+    refresh_token = None
+    expires_at = getattr(access_token, "expires_at", None)
+    scopes = getattr(access_token, "scopes", None)
+
+    upstream = await _resolve_upstream_token_set(_auth_provider)
+    if upstream is not None:
+        token = getattr(upstream, "access_token", None) or token
+        refresh_token = getattr(upstream, "refresh_token", None)
+        upstream_expires_at = getattr(upstream, "expires_at", None)
+        if upstream_expires_at:
+            expires_at = upstream_expires_at
+        upstream_scope = getattr(upstream, "scope", None)
+        if upstream_scope:
+            scopes = upstream_scope.split()
+        if not refresh_token:
+            logger.warning(
+                "FastMCP holds no upstream refresh token for this session, so the "
+                "Google credential cannot renew itself and will fail once Google's "
+                "access token expires. A fresh consent is needed."
+            )
+    else:
+        logger.debug(
+            "No FastMCP upstream token set resolved for this request; building a "
+            "Google credential without a refresh token."
         )
 
     expiry = None
-    expires_at = getattr(access_entry, "expires_at", None)
     if expires_at:
         try:
             expiry_candidate = datetime.fromtimestamp(expires_at, tz=timezone.utc)
@@ -1063,11 +1160,9 @@ def _build_credentials_from_provider(
         except Exception:  # pragma: no cover - defensive
             expiry = None
 
-    scopes = getattr(access_entry, "scopes", None)
-
     return Credentials(
-        token=access_token.token,
-        refresh_token=refresh_token_obj.token if refresh_token_obj else None,
+        token=token,
+        refresh_token=refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=client_id,
         client_secret=client_secret,
@@ -1076,7 +1171,7 @@ def _build_credentials_from_provider(
     )
 
 
-def ensure_session_from_access_token(
+async def ensure_session_from_access_token(
     access_token: AccessToken,
     user_email: Optional[str],
     mcp_session_id: Optional[str] = None,
@@ -1090,7 +1185,7 @@ def ensure_session_from_access_token(
     if not email and getattr(access_token, "claims", None):
         email = access_token.claims.get("email")
 
-    credentials = _build_credentials_from_provider(access_token)
+    credentials = await _build_credentials_from_provider(access_token)
     store_expiry: Optional[datetime] = None
 
     if credentials is None:
@@ -1163,14 +1258,9 @@ def get_credentials_from_token(
                 logger.debug(f"Found matching credentials from store for {user_email}")
                 return credentials
 
-        # If the FastMCP provider is managing tokens, sync from provider storage
-        if _auth_provider:
-            access_record = getattr(_auth_provider, "_access_tokens", {}).get(
-                access_token
-            )
-            if access_record:
-                logger.debug("Building credentials from FastMCP provider cache")
-                return ensure_session_from_access_token(access_record, user_email)
+        # The FastMCP provider path lives in ensure_session_from_access_token,
+        # which is async and reads the upstream token store directly. FastMCP
+        # 3.4.2 keeps no synchronous provider cache to consult here.
 
         # Otherwise, create minimal credentials with just the access token
         # Assume token is valid for 1 hour (typical for Google tokens)
